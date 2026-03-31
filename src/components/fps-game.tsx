@@ -3,6 +3,7 @@
 import {
   DataSnapshot,
   DatabaseReference,
+  get,
   limitToLast,
   onChildAdded,
   onDisconnect,
@@ -17,13 +18,18 @@ import {
 import NextImage from "next/image";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
+import { MTLLoader } from "three/examples/jsm/loaders/MTLLoader.js";
+import { OBJLoader } from "three/examples/jsm/loaders/OBJLoader.js";
 import { canInitializeFirebase, getMissingFirebaseEnv, getRealtimeDatabase } from "@/lib/firebase";
 
 type MatchPhase = "menu" | "connecting" | "playing" | "error";
+type Team = "blue" | "red";
+type TeamPreference = Team | "auto";
 
 type PlayerSnapshot = {
   id: string;
   name: string;
+  team: Team;
   color: string;
   faceTexture: string | null;
   x: number;
@@ -73,6 +79,7 @@ type Session = {
   roomId: string;
   playerId: string;
   playerName: string;
+  team: Team;
   localRef: DatabaseReference;
   eventsRef: DatabaseReference;
   joinedAt: number;
@@ -95,11 +102,22 @@ type Obstacle = {
   h: number;
 };
 
+type WalkSurface = {
+  x: number;
+  z: number;
+  w: number;
+  d: number;
+  top: number;
+};
+
+type HitZone = "head" | "body";
+
 type RemoteAvatar = {
   group: THREE.Group;
   body: THREE.Mesh;
   faceDecal: THREE.Mesh;
   hpFill: THREE.Mesh;
+  gunMount: THREE.Group;
   targetPosition: THREE.Vector3;
   targetYaw: number;
   appliedFaceTexture: string | null;
@@ -114,6 +132,10 @@ const ARENA_LIMIT = 58;
 const PLAYER_EYE_HEIGHT = 1.7;
 const PLAYER_RADIUS = 0.45;
 const PLAYER_SPEED = 8.3;
+const SPRINT_SPEED = 10.8;
+const SLIDE_SPEED = 14.2;
+const SLIDE_DURATION_SECONDS = 0.45;
+const MAX_STEP_UP = 1.12;
 const GRAVITY = 24;
 const JUMP_FORCE = 8.8;
 const SHOOT_COOLDOWN_MS = 170;
@@ -124,21 +146,62 @@ const TRACER_DURATION_MS = 110;
 const FACE_TEXTURE_SIZE = 160;
 const MAX_FACE_DATA_URL_LENGTH = 820_000;
 
-const SPAWN_POINTS = [
+const TEAM_COLORS: Record<Team, string> = {
+  blue: "#3ea7ff",
+  red: "#ff5f66",
+};
+
+const TEAM_SPAWN_POINTS: Record<Team, THREE.Vector3[]> = {
+  blue: [
+    new THREE.Vector3(-50, PLAYER_EYE_HEIGHT, -46),
+    new THREE.Vector3(-40, PLAYER_EYE_HEIGHT, -36),
+    new THREE.Vector3(-47, PLAYER_EYE_HEIGHT, -24),
+  ],
+  red: [
+    new THREE.Vector3(50, PLAYER_EYE_HEIGHT, 46),
+    new THREE.Vector3(40, PLAYER_EYE_HEIGHT, 36),
+    new THREE.Vector3(47, PLAYER_EYE_HEIGHT, 24),
+  ],
+};
+
+const NEUTRAL_SPAWN_POINTS = [
   new THREE.Vector3(-32, PLAYER_EYE_HEIGHT, -24),
   new THREE.Vector3(30, PLAYER_EYE_HEIGHT, -20),
   new THREE.Vector3(-24, PLAYER_EYE_HEIGHT, 32),
-  new THREE.Vector3(28, PLAYER_EYE_HEIGHT, 26),
-  new THREE.Vector3(0, PLAYER_EYE_HEIGHT, 0),
+  new THREE.Vector3(-44, PLAYER_EYE_HEIGHT, -36),
+  new THREE.Vector3(42, PLAYER_EYE_HEIGHT, -38),
 ];
 
-const OBSTACLES: Obstacle[] = [
+const BLOCKERS: Obstacle[] = [
   { x: 0, z: 0, w: 16, d: 3, h: 3.5 },
   { x: -16, z: 14, w: 4, d: 18, h: 4.2 },
   { x: 16, z: -14, w: 4, d: 18, h: 4.2 },
   { x: 20, z: 20, w: 8, d: 8, h: 4.8 },
   { x: -22, z: -18, w: 12, d: 5, h: 2.8 },
   { x: 5, z: -28, w: 7, d: 7, h: 3.8 },
+  { x: -40, z: 30, w: 2.2, d: 2.2, h: 18 },
+  { x: -30, z: 30, w: 2.2, d: 2.2, h: 18 },
+  { x: -40, z: 40, w: 2.2, d: 2.2, h: 18 },
+  { x: -30, z: 40, w: 2.2, d: 2.2, h: 18 },
+  { x: 30, z: 26, w: 18, d: 8, h: 6.5 },
+  { x: 30, z: 42, w: 18, d: 8, h: 6.5 },
+];
+
+const WALK_SURFACES: WalkSurface[] = [
+  { x: -35, z: 35, w: 13, d: 13, top: 8 },
+  { x: -35, z: 35, w: 7, d: 7, top: 14 },
+  { x: 30, z: 26, w: 18, d: 8, top: 6.5 },
+  { x: 30, z: 42, w: 18, d: 8, top: 6.5 },
+];
+
+const TOWER_STEPS: WalkSurface[] = [
+  { x: -27.5, z: 20.5, w: 3.5, d: 3.2, top: 1.1 },
+  { x: -28.5, z: 23.5, w: 3.5, d: 3.2, top: 2.2 },
+  { x: -29.5, z: 26.5, w: 3.5, d: 3.2, top: 3.3 },
+  { x: -30.5, z: 29.5, w: 3.5, d: 3.2, top: 4.4 },
+  { x: -31.5, z: 32.5, w: 3.5, d: 3.2, top: 5.5 },
+  { x: -32.5, z: 35.5, w: 3.5, d: 3.2, top: 6.6 },
+  { x: -33.5, z: 38.5, w: 3.5, d: 3.2, top: 7.7 },
 ];
 
 function safeNumber(input: unknown, fallback: number): number {
@@ -172,19 +235,35 @@ function getOrCreatePlayerId(): string {
   return newId;
 }
 
-function getPlayerColor(playerId: string): string {
-  let hash = 0;
-  for (let i = 0; i < playerId.length; i += 1) {
-    hash = (hash << 5) - hash + playerId.charCodeAt(i);
-    hash |= 0;
-  }
-
-  const hue = Math.abs(hash) % 360;
-  return `hsl(${hue} 70% 58%)`;
+function getTeamColor(team: Team): string {
+  return TEAM_COLORS[team];
 }
 
-function randomSpawnPoint(): THREE.Vector3 {
-  const base = SPAWN_POINTS[Math.floor(Math.random() * SPAWN_POINTS.length)];
+function isTeam(input: unknown): input is Team {
+  return input === "blue" || input === "red";
+}
+
+function pickTeam(
+  preference: TeamPreference,
+  players: Record<string, PlayerSnapshot>,
+): Team {
+  if (preference === "blue" || preference === "red") {
+    return preference;
+  }
+
+  let blueCount = 0;
+  let redCount = 0;
+  for (const player of Object.values(players)) {
+    if (player.team === "blue") blueCount += 1;
+    if (player.team === "red") redCount += 1;
+  }
+
+  return blueCount <= redCount ? "blue" : "red";
+}
+
+function randomSpawnPoint(team: Team): THREE.Vector3 {
+  const points = TEAM_SPAWN_POINTS[team] ?? NEUTRAL_SPAWN_POINTS;
+  const base = points[Math.floor(Math.random() * points.length)];
   const spread = 2.8;
   return new THREE.Vector3(
     base.x + (Math.random() * 2 - 1) * spread,
@@ -241,10 +320,19 @@ function readPlayers(snapshot: DataSnapshot): Record<string, PlayerSnapshot> {
 
   const players: Record<string, PlayerSnapshot> = {};
   for (const [id, player] of Object.entries(raw)) {
+    const parsedTeam = isTeam(player.team)
+      ? player.team
+      : player.color === TEAM_COLORS.red
+        ? "red"
+        : "blue";
     players[id] = {
       id,
       name: typeof player.name === "string" ? player.name : "Player",
-      color: typeof player.color === "string" ? player.color : "#88c0ff",
+      team: parsedTeam,
+      color:
+        typeof player.color === "string"
+          ? player.color
+          : getTeamColor(parsedTeam),
       faceTexture:
         typeof player.faceTexture === "string" && player.faceTexture.startsWith("data:image/")
           ? player.faceTexture
@@ -274,6 +362,23 @@ function toThreeColor(color: string): THREE.Color {
   } catch {
     return new THREE.Color("#8ac0ff");
   }
+}
+
+function getHitMetadata(object: THREE.Object3D | null): { playerId: string | null; hitZone: HitZone } {
+  let current: THREE.Object3D | null = object;
+  let hitZone: HitZone = "body";
+
+  while (current) {
+    if (current.userData.hitZone === "head") {
+      hitZone = "head";
+    }
+    if (typeof current.userData.playerId === "string") {
+      return { playerId: current.userData.playerId, hitZone };
+    }
+    current = current.parent;
+  }
+
+  return { playerId: null, hitZone };
 }
 
 function readRoomFromQuery(): string {
@@ -330,13 +435,15 @@ export default function FpsGame() {
   const [hud, setHud] = useState({ hp: 100, kills: 0, deaths: 0, respawnSeconds: 0 });
   const [sessionNonce, setSessionNonce] = useState(0);
   const [selfPlayerId, setSelfPlayerId] = useState("");
+  const [teamPreference, setTeamPreference] = useState<TeamPreference>("auto");
+  const [selfTeam, setSelfTeam] = useState<Team>("blue");
   const [faceTextureData, setFaceTextureData] = useState<string | null>(null);
   const [faceFileName, setFaceFileName] = useState("");
 
   const playersRef = useRef<Record<string, PlayerSnapshot>>({});
   const sessionRef = useRef<Session | null>(null);
   const localRef = useRef<LocalPlayerState>({
-    position: randomSpawnPoint(),
+    position: randomSpawnPoint("blue"),
     yaw: Math.PI,
     pitch: 0,
     hp: 100,
@@ -381,6 +488,7 @@ export default function FpsGame() {
     setPlayers({});
     setKillFeed([]);
     setSelfPlayerId("");
+    setSelfTeam("blue");
     setIsPointerLocked(false);
   }, []);
 
@@ -421,6 +529,11 @@ export default function FpsGame() {
       }
 
       if (!isCurrentSessionEvent || event.to !== session.playerId) {
+        return;
+      }
+
+      const attacker = playersRef.current[event.from];
+      if (attacker && attacker.team === session.team) {
         return;
       }
 
@@ -477,13 +590,17 @@ export default function FpsGame() {
 
       const playerId = getOrCreatePlayerId();
       const playerName = sanitizeName(nickname) || `Player-${playerId.slice(0, 4)}`;
-      const color = getPlayerColor(playerId);
-      const spawn = randomSpawnPoint();
 
       const roomPlayersRef = ref(db, `rooms/${roomId}/players`);
       const localPlayerRef = ref(db, `rooms/${roomId}/players/${playerId}`);
       const roomEventsRef = ref(db, `rooms/${roomId}/events`);
       const disconnectRef = onDisconnect(localPlayerRef);
+
+      const existingPlayersSnapshot = await get(roomPlayersRef);
+      const existingPlayers = readPlayers(existingPlayersSnapshot);
+      const team = pickTeam(teamPreference, existingPlayers);
+      const color = getTeamColor(team);
+      const spawn = randomSpawnPoint(team);
 
       localRef.current = {
         position: spawn.clone(),
@@ -497,6 +614,7 @@ export default function FpsGame() {
 
       await set(localPlayerRef, {
         name: playerName,
+        team,
         color,
         faceTexture: faceTextureData,
         x: spawn.x,
@@ -529,6 +647,7 @@ export default function FpsGame() {
         roomId,
         playerId,
         playerName,
+        team,
         localRef: localPlayerRef,
         eventsRef: roomEventsRef,
         joinedAt: Date.now(),
@@ -573,13 +692,14 @@ export default function FpsGame() {
       sessionRef.current = session;
       setSessionNonce((value) => value + 1);
       setSelfPlayerId(playerId);
+      setSelfTeam(team);
       setActiveRoom(roomId);
       setRoomInput(roomId);
       setHudFromLocal();
       window.history.replaceState({}, "", `/?room=${roomId}`);
       setPhase("playing");
     },
-    [faceTextureData, handleEvent, nickname, setHudFromLocal],
+    [faceTextureData, handleEvent, nickname, setHudFromLocal, teamPreference],
   );
 
   const handleFaceUpload = useCallback(async (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -642,7 +762,7 @@ export default function FpsGame() {
     renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
     renderer.setSize(mount.clientWidth, mount.clientHeight);
     renderer.shadowMap.enabled = true;
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.shadowMap.type = THREE.PCFShadowMap;
     mount.appendChild(renderer.domElement);
 
     const hemi = new THREE.HemisphereLight("#9fd5ff", "#6f7d57", 0.9);
@@ -701,7 +821,7 @@ export default function FpsGame() {
       metalness: 0.08,
     });
 
-    for (const obstacle of OBSTACLES) {
+    for (const obstacle of BLOCKERS) {
       const mesh = new THREE.Mesh(
         new THREE.BoxGeometry(obstacle.w, obstacle.h, obstacle.d),
         obstacleMaterial,
@@ -712,10 +832,43 @@ export default function FpsGame() {
       scene.add(mesh);
     }
 
+    const platformMaterial = new THREE.MeshStandardMaterial({
+      color: "#4b5769",
+      roughness: 0.74,
+      metalness: 0.18,
+    });
+
+    for (const surface of WALK_SURFACES) {
+      const mesh = new THREE.Mesh(
+        new THREE.BoxGeometry(surface.w, 0.65, surface.d),
+        platformMaterial,
+      );
+      mesh.position.set(surface.x, surface.top + 0.325, surface.z);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      scene.add(mesh);
+    }
+
+    for (const step of TOWER_STEPS) {
+      const mesh = new THREE.Mesh(
+        new THREE.BoxGeometry(step.w, 0.36, step.d),
+        new THREE.MeshStandardMaterial({
+          color: "#a4785d",
+          roughness: 0.78,
+          metalness: 0.07,
+        }),
+      );
+      mesh.position.set(step.x, step.top + 0.18, step.z);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      scene.add(mesh);
+    }
+
     const remoteAvatars = new Map<string, RemoteAvatar>();
     const rayTargets: THREE.Object3D[] = [];
     const tracers: ShotTracer[] = [];
     const textureLoader = new THREE.TextureLoader();
+    let gunTemplate: THREE.Group | null = null;
 
     const applyFaceTexture = (avatar: RemoteAvatar, faceTexture: string | null) => {
       const material = avatar.faceDecal.material;
@@ -755,6 +908,75 @@ export default function FpsGame() {
       );
     };
 
+    const attachGunToMount = (mount: THREE.Group) => {
+      mount.clear();
+      if (gunTemplate) {
+        const clone = gunTemplate.clone(true);
+        mount.add(clone);
+        return;
+      }
+
+      const fallback = new THREE.Mesh(
+        new THREE.BoxGeometry(0.16, 0.16, 0.95),
+        new THREE.MeshStandardMaterial({
+          color: "#2f3746",
+          roughness: 0.55,
+          metalness: 0.3,
+          emissive: "#10131b",
+          emissiveIntensity: 0.28,
+        }),
+      );
+      mount.add(fallback);
+    };
+
+    const loadGunTemplate = () => {
+      const mtlLoader = new MTLLoader();
+      mtlLoader.setPath("/assets/gun/");
+      mtlLoader.setResourcePath("/assets/gun/");
+
+      mtlLoader.load(
+        "Gun.mtl",
+        (materials) => {
+          materials.preload();
+          const objLoader = new OBJLoader();
+          objLoader.setMaterials(materials);
+          objLoader.setPath("/assets/gun/");
+          objLoader.load(
+            "Gun.obj",
+            (object) => {
+              object.scale.setScalar(1.18);
+              object.rotation.set(0, -Math.PI / 2, 0.08);
+              object.position.set(0.03, -0.03, 0.02);
+              object.traverse((node) => {
+                if (node instanceof THREE.Mesh) {
+                  node.castShadow = true;
+                  node.receiveShadow = true;
+                }
+              });
+
+              gunTemplate = new THREE.Group();
+              gunTemplate.add(object);
+
+              for (const avatar of remoteAvatars.values()) {
+                attachGunToMount(avatar.gunMount);
+              }
+              attachGunToMount(viewGunMount);
+            },
+            undefined,
+            () => {
+              gunTemplate = null;
+            },
+          );
+        },
+        undefined,
+        () => {
+          gunTemplate = null;
+        },
+      );
+    };
+
+    loadGunTemplate();
+
     const addRemoteAvatar = (player: PlayerSnapshot): RemoteAvatar => {
       const group = new THREE.Group();
       const bodyMaterial = new THREE.MeshStandardMaterial({
@@ -769,6 +991,7 @@ export default function FpsGame() {
       body.position.y = 1.28;
       body.castShadow = true;
       body.userData.playerId = player.id;
+      body.userData.hitZone = "body";
 
       const visor = new THREE.Mesh(
         new THREE.SphereGeometry(0.26, 12, 12),
@@ -780,8 +1003,9 @@ export default function FpsGame() {
           opacity: 0.8,
         }),
       );
-      visor.position.set(0, 2.12, 0.11);
+      visor.position.set(0, 2.12, -0.1);
       visor.userData.playerId = player.id;
+      visor.userData.hitZone = "head";
 
       const faceDecal = new THREE.Mesh(
         new THREE.PlaneGeometry(0.42, 0.42),
@@ -793,40 +1017,44 @@ export default function FpsGame() {
           side: THREE.DoubleSide,
         }),
       );
-      faceDecal.position.set(0, 2.1, 0.28);
+      faceDecal.position.set(0, 2.1, -0.28);
       faceDecal.userData.playerId = player.id;
+      faceDecal.userData.hitZone = "head";
 
       const hpBack = new THREE.Mesh(
         new THREE.PlaneGeometry(0.52, 0.08),
-        new THREE.MeshBasicMaterial({ color: "#11151e", transparent: true, opacity: 0.72 }),
+        new THREE.MeshBasicMaterial({
+          color: "#11151e",
+          transparent: true,
+          opacity: 0.72,
+          side: THREE.DoubleSide,
+        }),
       );
-      hpBack.position.set(0, 2.66, 0);
+      hpBack.position.set(0, 2.66, -0.46);
 
       const hpFill = new THREE.Mesh(
         new THREE.PlaneGeometry(0.48, 0.05),
-        new THREE.MeshBasicMaterial({ color: "#58f58b" }),
+        new THREE.MeshBasicMaterial({ color: "#58f58b", side: THREE.DoubleSide }),
       );
-      hpFill.position.set(0, 2.66, 0.01);
+      hpFill.position.set(0, 2.66, -0.45);
 
-      const rifle = new THREE.Mesh(
-        new THREE.BoxGeometry(0.16, 0.16, 0.95),
-        new THREE.MeshStandardMaterial({ color: "#2f3746", roughness: 0.55, metalness: 0.3 }),
-      );
-      rifle.position.set(0.21, 1.48, -0.5);
-      rifle.userData.playerId = player.id;
+      const gunMount = new THREE.Group();
+      gunMount.position.set(0.3, 1.45, -0.34);
+      attachGunToMount(gunMount);
 
-      group.add(body, visor, faceDecal, hpBack, hpFill, rifle);
+      group.add(body, visor, faceDecal, hpBack, hpFill, gunMount);
       group.position.set(player.x, 0, player.z);
       group.rotation.y = player.yaw;
 
       scene.add(group);
-      rayTargets.push(body, visor, faceDecal, rifle);
+      rayTargets.push(body, visor, faceDecal);
 
       const avatar: RemoteAvatar = {
         group,
         body,
         faceDecal,
         hpFill,
+        gunMount,
         targetPosition: new THREE.Vector3(player.x, 0, player.z),
         targetYaw: player.yaw,
         appliedFaceTexture: null,
@@ -854,6 +1082,7 @@ export default function FpsGame() {
       if (faceMaterial instanceof THREE.MeshStandardMaterial && faceMaterial.map) {
         faceMaterial.map.dispose();
       }
+      existing.gunMount.clear();
       remoteAvatars.delete(id);
     };
 
@@ -865,9 +1094,17 @@ export default function FpsGame() {
     const lastShotRef = { value: 0 };
     const verticalVelocityRef = { value: 0 };
     const hudTickRef = { value: 0 };
+    const slideTimerRef = { value: 0 };
+    const slideDirection = new THREE.Vector3(0, 0, 0);
     let audioContext: AudioContext | null = null;
 
     const pointerElement = renderer.domElement;
+    const viewGunMount = new THREE.Group();
+    viewGunMount.position.set(0.26, -0.24, -0.46);
+    viewGunMount.rotation.set(-0.09, 0.02, -0.16);
+    camera.add(viewGunMount);
+    scene.add(camera);
+    attachGunToMount(viewGunMount);
 
     const onResize = () => {
       const width = mount.clientWidth;
@@ -882,7 +1119,7 @@ export default function FpsGame() {
     };
 
     const onKeyDown = (event: KeyboardEvent) => {
-      if (["KeyW", "KeyA", "KeyS", "KeyD", "Space"].includes(event.code)) {
+      if (["KeyW", "KeyA", "KeyS", "KeyD", "Space", "ShiftLeft", "ShiftRight"].includes(event.code)) {
         event.preventDefault();
       }
       controls.add(event.code);
@@ -902,17 +1139,6 @@ export default function FpsGame() {
         -1.25,
         Math.min(1.25, localRef.current.pitch - event.movementY * LOOK_SENSITIVITY),
       );
-    };
-
-    const getPlayerIdFromHit = (object: THREE.Object3D | null): string | null => {
-      let current: THREE.Object3D | null = object;
-      while (current) {
-        if (typeof current.userData.playerId === "string") {
-          return current.userData.playerId;
-        }
-        current = current.parent;
-      }
-      return null;
     };
 
     const flashHitMarker = () => {
@@ -988,8 +1214,8 @@ export default function FpsGame() {
       shotRay.setFromCamera(cameraVector, camera);
       const hitResults = shotRay.intersectObjects(rayTargets, true);
       const target = hitResults.find((candidate) => {
-        const id = getPlayerIdFromHit(candidate.object);
-        return id && id !== session.playerId;
+        const metadata = getHitMetadata(candidate.object);
+        return metadata.playerId && metadata.playerId !== session.playerId;
       });
       const worldDirection = camera.getWorldDirection(new THREE.Vector3());
       const tracerEnd = target
@@ -1001,13 +1227,20 @@ export default function FpsGame() {
         return;
       }
 
-      const targetId = getPlayerIdFromHit(target.object);
+      const metadata = getHitMetadata(target.object);
+      const targetId = metadata.playerId;
       if (!targetId) {
         return;
       }
 
-      const targetName = playersRef.current[targetId]?.name ?? "Enemy";
-      await session.sendHit(targetId, targetName, 34);
+      const targetPlayer = playersRef.current[targetId];
+      if (targetPlayer?.team === session.team) {
+        return;
+      }
+
+      const targetName = targetPlayer?.name ?? "Enemy";
+      const damage = metadata.hitZone === "head" ? 40 : 10;
+      await session.sendHit(targetId, targetName, damage);
       flashHitMarker();
     };
 
@@ -1017,7 +1250,9 @@ export default function FpsGame() {
       }
 
       if (document.pointerLockElement !== pointerElement) {
-        void pointerElement.requestPointerLock();
+        pointerElement.requestPointerLock().catch(() => {
+          // Ignore transient browser lock errors after manual unlock.
+        });
         return;
       }
 
@@ -1033,15 +1268,40 @@ export default function FpsGame() {
 
     onResize();
 
-    const collidesObstacle = (x: number, z: number): boolean => {
-      return OBSTACLES.some((obstacle) => {
+    const walkableSurfaces = [...WALK_SURFACES, ...TOWER_STEPS];
+
+    const collidesObstacle = (x: number, z: number, feetY: number): boolean => {
+      return BLOCKERS.some((obstacle) => {
         return (
           x > obstacle.x - obstacle.w / 2 - PLAYER_RADIUS &&
           x < obstacle.x + obstacle.w / 2 + PLAYER_RADIUS &&
           z > obstacle.z - obstacle.d / 2 - PLAYER_RADIUS &&
-          z < obstacle.z + obstacle.d / 2 + PLAYER_RADIUS
+          z < obstacle.z + obstacle.d / 2 + PLAYER_RADIUS &&
+          feetY < obstacle.h + 0.38
         );
       });
+    };
+
+    const getFloorHeight = (x: number, z: number, feetY: number): number => {
+      let floorHeight = 0;
+      for (const surface of walkableSurfaces) {
+        const inside =
+          x > surface.x - surface.w / 2 &&
+          x < surface.x + surface.w / 2 &&
+          z > surface.z - surface.d / 2 &&
+          z < surface.z + surface.d / 2;
+
+        if (!inside) {
+          continue;
+        }
+
+        const canStepUp = surface.top - feetY <= MAX_STEP_UP;
+        const alreadyAbove = feetY >= surface.top - 0.08;
+        if ((canStepUp || alreadyAbove) && surface.top > floorHeight) {
+          floorHeight = surface.top;
+        }
+      }
+      return floorHeight;
     };
 
     const forward = new THREE.Vector3();
@@ -1058,7 +1318,7 @@ export default function FpsGame() {
       lastFrameRef.value = now;
 
       if (localRef.current.respawnUntil && Date.now() >= localRef.current.respawnUntil) {
-        const spawn = randomSpawnPoint();
+        const spawn = randomSpawnPoint(session.team);
         localRef.current.position.copy(spawn);
         localRef.current.hp = 100;
         localRef.current.respawnUntil = null;
@@ -1073,6 +1333,15 @@ export default function FpsGame() {
       }
 
       const isAlive = localRef.current.hp > 0 && !localRef.current.respawnUntil;
+      const feetBeforeMove = localRef.current.position.y - PLAYER_EYE_HEIGHT;
+      const floorBeforeMove = getFloorHeight(
+        localRef.current.position.x,
+        localRef.current.position.z,
+        feetBeforeMove,
+      );
+      const onGround =
+        Math.abs(feetBeforeMove - floorBeforeMove) <= 0.06 && verticalVelocityRef.value <= 0.001;
+
       if (isAlive) {
         movement.set(0, 0, 0);
         camera.getWorldDirection(forward);
@@ -1088,8 +1357,18 @@ export default function FpsGame() {
         if (controls.has("KeyD")) movement.add(strafe);
         if (controls.has("KeyA")) movement.sub(strafe);
 
-        if (movement.lengthSq() > 0) {
-          movement.normalize().multiplyScalar(PLAYER_SPEED * delta);
+        const isShiftDown = controls.has("ShiftLeft") || controls.has("ShiftRight");
+        if (onGround && isShiftDown && movement.lengthSq() > 0 && slideTimerRef.value <= 0) {
+          slideTimerRef.value = SLIDE_DURATION_SECONDS;
+          slideDirection.copy(movement).normalize();
+        }
+
+        if (slideTimerRef.value > 0) {
+          slideTimerRef.value = Math.max(0, slideTimerRef.value - delta);
+          movement.copy(slideDirection).multiplyScalar(SLIDE_SPEED * delta);
+        } else if (movement.lengthSq() > 0) {
+          const moveSpeed = isShiftDown ? SPRINT_SPEED : PLAYER_SPEED;
+          movement.normalize().multiplyScalar(moveSpeed * delta);
         }
 
         const prevZ = localRef.current.position.z;
@@ -1098,7 +1377,7 @@ export default function FpsGame() {
           -ARENA_LIMIT,
           ARENA_LIMIT,
         );
-        if (!collidesObstacle(maybeX, prevZ)) {
+        if (!collidesObstacle(maybeX, prevZ, feetBeforeMove)) {
           localRef.current.position.x = maybeX;
         }
 
@@ -1107,19 +1386,26 @@ export default function FpsGame() {
           -ARENA_LIMIT,
           ARENA_LIMIT,
         );
-        if (!collidesObstacle(localRef.current.position.x, maybeZ)) {
+        if (!collidesObstacle(localRef.current.position.x, maybeZ, feetBeforeMove)) {
           localRef.current.position.z = maybeZ;
         }
 
-        if (controls.has("Space") && localRef.current.position.y <= PLAYER_EYE_HEIGHT + 0.01) {
+        if (controls.has("Space") && onGround) {
           verticalVelocityRef.value = JUMP_FORCE;
+          slideTimerRef.value = 0;
         }
       }
 
       verticalVelocityRef.value -= GRAVITY * delta;
       localRef.current.position.y += verticalVelocityRef.value * delta;
-      if (localRef.current.position.y <= PLAYER_EYE_HEIGHT) {
-        localRef.current.position.y = PLAYER_EYE_HEIGHT;
+      const floorAfterMove = getFloorHeight(
+        localRef.current.position.x,
+        localRef.current.position.z,
+        localRef.current.position.y - PLAYER_EYE_HEIGHT,
+      );
+      const targetEyeY = floorAfterMove + PLAYER_EYE_HEIGHT;
+      if (localRef.current.position.y <= targetEyeY) {
+        localRef.current.position.y = targetEyeY;
         verticalVelocityRef.value = 0;
       }
 
@@ -1256,6 +1542,28 @@ export default function FpsGame() {
     });
   }, [players]);
 
+  const teamStats = useMemo(() => {
+    const stats = {
+      blue: { kills: 0, players: 0 },
+      red: { kills: 0, players: 0 },
+    };
+
+    for (const player of Object.values(players)) {
+      stats[player.team].kills += player.kills;
+      stats[player.team].players += 1;
+    }
+
+    return stats;
+  }, [players]);
+
+  const bluePlayers = useMemo(() => {
+    return sortedPlayers.filter((player) => player.team === "blue");
+  }, [sortedPlayers]);
+
+  const redPlayers = useMemo(() => {
+    return sortedPlayers.filter((player) => player.team === "red");
+  }, [sortedPlayers]);
+
   if (phase === "menu" || phase === "connecting" || phase === "error") {
     return (
       <main className="min-h-screen w-full px-6 py-8 text-white">
@@ -1293,6 +1601,50 @@ export default function FpsGame() {
                 className="w-full rounded-xl border border-slate-400/35 bg-slate-900/80 px-4 py-3 text-sm uppercase outline-none ring-cyan-300 transition focus:ring-2"
               />
             </label>
+
+            <div className="space-y-2">
+              <span className="block text-xs uppercase tracking-[0.28em] text-cyan-200">Team</span>
+              <div className="grid gap-2 sm:grid-cols-3">
+                <button
+                  type="button"
+                  onClick={() => setTeamPreference("auto")}
+                  className={`rounded-lg border px-3 py-2 text-xs font-semibold uppercase tracking-[0.2em] transition ${
+                    teamPreference === "auto"
+                      ? "border-cyan-300/60 bg-cyan-400/20 text-cyan-100"
+                      : "border-slate-400/35 bg-slate-900/80 text-sky-100"
+                  }`}
+                >
+                  Auto
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setTeamPreference("blue")}
+                  className={`rounded-lg border px-3 py-2 text-xs font-semibold uppercase tracking-[0.2em] transition ${
+                    teamPreference === "blue"
+                      ? "border-blue-300/65 bg-blue-500/20 text-blue-100"
+                      : "border-slate-400/35 bg-slate-900/80 text-sky-100"
+                  }`}
+                >
+                  Blue
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setTeamPreference("red")}
+                  className={`rounded-lg border px-3 py-2 text-xs font-semibold uppercase tracking-[0.2em] transition ${
+                    teamPreference === "red"
+                      ? "border-red-300/65 bg-red-500/20 text-red-100"
+                      : "border-slate-400/35 bg-slate-900/80 text-sky-100"
+                  }`}
+                >
+                  Red
+                </button>
+              </div>
+              <p className="text-xs text-sky-100/75">
+                {teamPreference === "auto"
+                  ? "Auto balances teams using current players in the room."
+                  : `You will join team ${teamPreference.toUpperCase()}.`}
+              </p>
+            </div>
 
             <div className="space-y-2">
               <span className="block text-xs uppercase tracking-[0.28em] text-cyan-200">Face Image (JPG/PNG)</span>
@@ -1364,7 +1716,7 @@ export default function FpsGame() {
           </section>
 
           <section className="text-sm text-sky-100/90">
-            <p className="font-mono">Controls: `WASD` move, `Space` jump, `LMB` shoot, `Esc` unlock mouse.</p>
+            <p className="font-mono">Controls: `WASD` move, hold `Shift` to slide/sprint, `Space` jump, `LMB` shoot, `Esc` unlock mouse.</p>
           </section>
         </div>
       </main>
@@ -1392,6 +1744,12 @@ export default function FpsGame() {
         </div>
         <div className="hud-panel rounded-xl px-4 py-3">
           <p className="font-mono text-xs uppercase tracking-[0.26em] text-cyan-200">Status</p>
+          <p className="mt-1">
+            Team{" "}
+            <span className={selfTeam === "blue" ? "text-blue-200" : "text-red-200"}>
+              {selfTeam.toUpperCase()}
+            </span>
+          </p>
           <p className="mt-1">HP {hud.hp}</p>
           <p>Kills {hud.kills}</p>
           <p>Deaths {hud.deaths}</p>
@@ -1408,22 +1766,55 @@ export default function FpsGame() {
 
       <div className="pointer-events-none absolute right-4 top-4 z-20 w-72">
         <div className="hud-panel rounded-xl px-4 py-3">
+          <p className="font-mono text-xs uppercase tracking-[0.26em] text-cyan-200">Team Score</p>
+          <div className="mt-2 grid grid-cols-2 gap-2 text-sm">
+            <div className="rounded-lg border border-blue-300/40 bg-blue-500/12 px-3 py-2">
+              <p className="font-semibold uppercase tracking-[0.16em] text-blue-100">Blue</p>
+              <p className="mt-1 font-mono text-blue-50">{teamStats.blue.kills} Kills</p>
+              <p className="text-xs text-blue-100/80">{teamStats.blue.players} Players</p>
+            </div>
+            <div className="rounded-lg border border-red-300/40 bg-red-500/12 px-3 py-2">
+              <p className="font-semibold uppercase tracking-[0.16em] text-red-100">Red</p>
+              <p className="mt-1 font-mono text-red-50">{teamStats.red.kills} Kills</p>
+              <p className="text-xs text-red-100/80">{teamStats.red.players} Players</p>
+            </div>
+          </div>
+        </div>
+        <div className="mt-3 hud-panel rounded-xl px-4 py-3">
           <p className="font-mono text-xs uppercase tracking-[0.26em] text-cyan-200">Scoreboard</p>
-          <div className="mt-2 space-y-1 text-sm">
-            {sortedPlayers.map((player) => {
+          <div className="mt-2 space-y-2 text-sm">
+            <p className="text-xs font-semibold uppercase tracking-[0.16em] text-blue-100">Blue Team</p>
+            {bluePlayers.map((player) => {
               const isYou = player.id === selfPlayerId;
               return (
                 <div
                   key={player.id}
                   className={`flex items-center justify-between rounded px-2 py-1 ${isYou ? "bg-cyan-400/16" : "bg-black/20"}`}
                 >
-                  <span className="truncate pr-2" style={{ color: player.color }}>
+                  <span className="truncate pr-2 text-blue-100">
                     {isYou ? `${player.name} (you)` : player.name}
                   </span>
                   <span className="font-mono">{player.kills}/{player.deaths} | {player.hp}hp</span>
                 </div>
               );
             })}
+            {bluePlayers.length === 0 ? <p className="text-xs text-sky-100/70">No blue players.</p> : null}
+            <p className="pt-1 text-xs font-semibold uppercase tracking-[0.16em] text-red-100">Red Team</p>
+            {redPlayers.map((player) => {
+              const isYou = player.id === selfPlayerId;
+              return (
+                <div
+                  key={player.id}
+                  className={`flex items-center justify-between rounded px-2 py-1 ${isYou ? "bg-cyan-400/16" : "bg-black/20"}`}
+                >
+                  <span className="truncate pr-2 text-red-100">
+                    {isYou ? `${player.name} (you)` : player.name}
+                  </span>
+                  <span className="font-mono">{player.kills}/{player.deaths} | {player.hp}hp</span>
+                </div>
+              );
+            })}
+            {redPlayers.length === 0 ? <p className="text-xs text-sky-100/70">No red players.</p> : null}
           </div>
         </div>
       </div>
