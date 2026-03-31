@@ -1,0 +1,67 @@
+@import "tailwindcss";
+
+:root {
+  --background: #05070a;
+  --foreground: #f6f7fb;
+  --panel: rgba(12, 18, 28, 0.84);
+  --panel-border: rgba(130, 180, 255, 0.32);
+  --accent: #67dcff;
+  --accent-warm: #ff784f;
+  --font-title: "Bahnschrift", "Trebuchet MS", "Segoe UI", sans-serif;
+  --font-ui-mono: "Consolas", "Cascadia Mono", "Lucida Console", monospace;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-title);
+  --font-mono: var(--font-ui-mono);
+}
+
+body {
+  background:
+    radial-gradient(1200px 500px at 10% -10%, rgba(89, 165, 255, 0.16), transparent 65%),
+    radial-gradient(900px 600px at 100% 0%, rgba(0, 216, 177, 0.1), transparent 60%),
+    linear-gradient(180deg, #070d19 0%, #04060b 35%, #040507 100%);
+  color: var(--foreground);
+  font-family: var(--font-title), sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+button,
+input {
+  font-family: inherit;
+}
+
+.hud-panel {
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  backdrop-filter: blur(6px);
+}
+
+.scan-grid {
+  background-image:
+    linear-gradient(rgba(136, 186, 255, 0.08) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(136, 186, 255, 0.08) 1px, transparent 1px);
+  background-size: 42px 42px;
+}
+
+.crosshair {
+  width: 22px;
+  height: 22px;
+  border: 2px solid rgba(255, 255, 255, 0.85);
+  border-radius: 50%;
+  box-shadow: 0 0 16px rgba(103, 220, 255, 0.56);
+  opacity: 0.9;
+}
+
+.hit-marker {
+  color: var(--accent-warm);
+  text-shadow: 0 0 10px rgba(255, 120, 79, 0.8);
+  font-weight: 700;
+  font-size: 22px;
+  line-height: 1;
+}
