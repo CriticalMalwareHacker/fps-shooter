@@ -14,6 +14,7 @@ import {
   set,
   update,
 } from "firebase/database";
+import NextImage from "next/image";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import { canInitializeFirebase, getMissingFirebaseEnv, getRealtimeDatabase } from "@/lib/firebase";
@@ -24,6 +25,7 @@ type PlayerSnapshot = {
   id: string;
   name: string;
   color: string;
+  faceTexture: string | null;
   x: number;
   y: number;
   z: number;
@@ -96,8 +98,16 @@ type Obstacle = {
 type RemoteAvatar = {
   group: THREE.Group;
   body: THREE.Mesh;
+  faceDecal: THREE.Mesh;
+  hpFill: THREE.Mesh;
   targetPosition: THREE.Vector3;
   targetYaw: number;
+  appliedFaceTexture: string | null;
+};
+
+type ShotTracer = {
+  line: THREE.Line;
+  expiresAt: number;
 };
 
 const ARENA_LIMIT = 58;
@@ -110,6 +120,9 @@ const SHOOT_COOLDOWN_MS = 170;
 const RESPAWN_MS = 3000;
 const NETWORK_TICK_MS = 60;
 const LOOK_SENSITIVITY = 0.002;
+const TRACER_DURATION_MS = 110;
+const FACE_TEXTURE_SIZE = 160;
+const MAX_FACE_DATA_URL_LENGTH = 820_000;
 
 const SPAWN_POINTS = [
   new THREE.Vector3(-32, PLAYER_EYE_HEIGHT, -24),
@@ -232,6 +245,10 @@ function readPlayers(snapshot: DataSnapshot): Record<string, PlayerSnapshot> {
       id,
       name: typeof player.name === "string" ? player.name : "Player",
       color: typeof player.color === "string" ? player.color : "#88c0ff",
+      faceTexture:
+        typeof player.faceTexture === "string" && player.faceTexture.startsWith("data:image/")
+          ? player.faceTexture
+          : null,
       x: safeNumber(player.x, 0),
       y: safeNumber(player.y, PLAYER_EYE_HEIGHT),
       z: safeNumber(player.z, 0),
@@ -268,6 +285,36 @@ function readRoomFromQuery(): string {
   return fromQuery ? sanitizeRoom(fromQuery) : "";
 }
 
+async function createFaceTextureDataUrl(file: File): Promise<string> {
+  const url = URL.createObjectURL(file);
+
+  try {
+    const image = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error("Unable to load selected image."));
+      img.src = url;
+    });
+
+    const canvas = document.createElement("canvas");
+    canvas.width = FACE_TEXTURE_SIZE;
+    canvas.height = FACE_TEXTURE_SIZE;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      throw new Error("Canvas is not available in this browser.");
+    }
+
+    const source = Math.min(image.width, image.height);
+    const sx = (image.width - source) / 2;
+    const sy = (image.height - source) / 2;
+    ctx.drawImage(image, sx, sy, source, source, 0, 0, FACE_TEXTURE_SIZE, FACE_TEXTURE_SIZE);
+
+    return canvas.toDataURL("image/jpeg", 0.84);
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
 export default function FpsGame() {
   const mountRef = useRef<HTMLDivElement | null>(null);
 
@@ -283,6 +330,8 @@ export default function FpsGame() {
   const [hud, setHud] = useState({ hp: 100, kills: 0, deaths: 0, respawnSeconds: 0 });
   const [sessionNonce, setSessionNonce] = useState(0);
   const [selfPlayerId, setSelfPlayerId] = useState("");
+  const [faceTextureData, setFaceTextureData] = useState<string | null>(null);
+  const [faceFileName, setFaceFileName] = useState("");
 
   const playersRef = useRef<Record<string, PlayerSnapshot>>({});
   const sessionRef = useRef<Session | null>(null);
@@ -449,6 +498,7 @@ export default function FpsGame() {
       await set(localPlayerRef, {
         name: playerName,
         color,
+        faceTexture: faceTextureData,
         x: spawn.x,
         y: spawn.y,
         z: spawn.z,
@@ -529,13 +579,44 @@ export default function FpsGame() {
       window.history.replaceState({}, "", `/?room=${roomId}`);
       setPhase("playing");
     },
-    [handleEvent, nickname, setHudFromLocal],
+    [faceTextureData, handleEvent, nickname, setHudFromLocal],
   );
+
+  const handleFaceUpload = useCallback(async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) {
+      return;
+    }
+
+    if (!file.type.startsWith("image/")) {
+      setErrorMessage("Please choose a PNG or JPG image file.");
+      return;
+    }
+
+    try {
+      const dataUrl = await createFaceTextureDataUrl(file);
+      if (dataUrl.length > MAX_FACE_DATA_URL_LENGTH) {
+        setErrorMessage("Image is too large after compression. Try a smaller file.");
+        return;
+      }
+
+      setFaceTextureData(dataUrl);
+      setFaceFileName(file.name);
+      setErrorMessage(null);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unable to process selected image.";
+      setErrorMessage(message);
+    } finally {
+      event.target.value = "";
+    }
+  }, []);
 
   const leaveMatch = useCallback(async () => {
     await stopSession();
     setActiveRoom("");
     setPhase("menu");
+    setFaceTextureData(null);
+    setFaceFileName("");
     window.history.replaceState({}, "", "/");
   }, [stopSession]);
 
@@ -633,6 +714,46 @@ export default function FpsGame() {
 
     const remoteAvatars = new Map<string, RemoteAvatar>();
     const rayTargets: THREE.Object3D[] = [];
+    const tracers: ShotTracer[] = [];
+    const textureLoader = new THREE.TextureLoader();
+
+    const applyFaceTexture = (avatar: RemoteAvatar, faceTexture: string | null) => {
+      const material = avatar.faceDecal.material;
+      if (!(material instanceof THREE.MeshStandardMaterial)) {
+        return;
+      }
+
+      if (!faceTexture) {
+        if (material.map) {
+          material.map.dispose();
+        }
+        material.map = null;
+        material.color.set("#ecf2ff");
+        material.needsUpdate = true;
+        avatar.appliedFaceTexture = null;
+        return;
+      }
+
+      textureLoader.load(
+        faceTexture,
+        (texture) => {
+          texture.colorSpace = THREE.SRGBColorSpace;
+          texture.minFilter = THREE.LinearFilter;
+          texture.magFilter = THREE.LinearFilter;
+          if (material.map) {
+            material.map.dispose();
+          }
+          material.map = texture;
+          material.color.set("#ffffff");
+          material.needsUpdate = true;
+          avatar.appliedFaceTexture = faceTexture;
+        },
+        undefined,
+        () => {
+          avatar.appliedFaceTexture = null;
+        },
+      );
+    };
 
     const addRemoteAvatar = (player: PlayerSnapshot): RemoteAvatar => {
       const group = new THREE.Group();
@@ -662,6 +783,31 @@ export default function FpsGame() {
       visor.position.set(0, 2.12, 0.11);
       visor.userData.playerId = player.id;
 
+      const faceDecal = new THREE.Mesh(
+        new THREE.PlaneGeometry(0.42, 0.42),
+        new THREE.MeshStandardMaterial({
+          color: "#ecf2ff",
+          roughness: 0.45,
+          metalness: 0.08,
+          transparent: true,
+          side: THREE.DoubleSide,
+        }),
+      );
+      faceDecal.position.set(0, 2.1, 0.28);
+      faceDecal.userData.playerId = player.id;
+
+      const hpBack = new THREE.Mesh(
+        new THREE.PlaneGeometry(0.52, 0.08),
+        new THREE.MeshBasicMaterial({ color: "#11151e", transparent: true, opacity: 0.72 }),
+      );
+      hpBack.position.set(0, 2.66, 0);
+
+      const hpFill = new THREE.Mesh(
+        new THREE.PlaneGeometry(0.48, 0.05),
+        new THREE.MeshBasicMaterial({ color: "#58f58b" }),
+      );
+      hpFill.position.set(0, 2.66, 0.01);
+
       const rifle = new THREE.Mesh(
         new THREE.BoxGeometry(0.16, 0.16, 0.95),
         new THREE.MeshStandardMaterial({ color: "#2f3746", roughness: 0.55, metalness: 0.3 }),
@@ -669,19 +815,26 @@ export default function FpsGame() {
       rifle.position.set(0.21, 1.48, -0.5);
       rifle.userData.playerId = player.id;
 
-      group.add(body, visor, rifle);
+      group.add(body, visor, faceDecal, hpBack, hpFill, rifle);
       group.position.set(player.x, 0, player.z);
       group.rotation.y = player.yaw;
 
       scene.add(group);
-      rayTargets.push(body, visor, rifle);
+      rayTargets.push(body, visor, faceDecal, rifle);
 
-      return {
+      const avatar: RemoteAvatar = {
         group,
         body,
+        faceDecal,
+        hpFill,
         targetPosition: new THREE.Vector3(player.x, 0, player.z),
         targetYaw: player.yaw,
+        appliedFaceTexture: null,
       };
+
+      applyFaceTexture(avatar, player.faceTexture);
+
+      return avatar;
     };
 
     const removeRemoteAvatar = (id: string) => {
@@ -697,6 +850,10 @@ export default function FpsGame() {
       });
       rayTargets.length = 0;
       rayTargets.push(...nextRayTargets);
+      const faceMaterial = existing.faceDecal.material;
+      if (faceMaterial instanceof THREE.MeshStandardMaterial && faceMaterial.map) {
+        faceMaterial.map.dispose();
+      }
       remoteAvatars.delete(id);
     };
 
@@ -708,6 +865,7 @@ export default function FpsGame() {
     const lastShotRef = { value: 0 };
     const verticalVelocityRef = { value: 0 };
     const hudTickRef = { value: 0 };
+    let audioContext: AudioContext | null = null;
 
     const pointerElement = renderer.domElement;
 
@@ -724,6 +882,9 @@ export default function FpsGame() {
     };
 
     const onKeyDown = (event: KeyboardEvent) => {
+      if (["KeyW", "KeyA", "KeyS", "KeyD", "Space"].includes(event.code)) {
+        event.preventDefault();
+      }
       controls.add(event.code);
     };
 
@@ -764,6 +925,51 @@ export default function FpsGame() {
       }, 90);
     };
 
+    const createTracer = (endPoint: THREE.Vector3) => {
+      const startPoint = camera.position.clone();
+      const geometry = new THREE.BufferGeometry().setFromPoints([startPoint, endPoint]);
+      const material = new THREE.LineBasicMaterial({
+        color: "#ffd36e",
+        transparent: true,
+        opacity: 0.95,
+      });
+      const line = new THREE.Line(geometry, material);
+      scene.add(line);
+      tracers.push({ line, expiresAt: performance.now() + TRACER_DURATION_MS });
+    };
+
+    const playShotSound = () => {
+      try {
+        if (!audioContext) {
+          audioContext = new window.AudioContext();
+        }
+
+        if (audioContext.state === "suspended") {
+          void audioContext.resume();
+        }
+
+        const nowTime = audioContext.currentTime;
+        const oscillator = audioContext.createOscillator();
+        const gainNode = audioContext.createGain();
+
+        oscillator.type = "square";
+        oscillator.frequency.setValueAtTime(760, nowTime);
+        oscillator.frequency.exponentialRampToValueAtTime(230, nowTime + 0.08);
+
+        gainNode.gain.setValueAtTime(0.0001, nowTime);
+        gainNode.gain.exponentialRampToValueAtTime(0.11, nowTime + 0.01);
+        gainNode.gain.exponentialRampToValueAtTime(0.0001, nowTime + 0.1);
+
+        oscillator.connect(gainNode);
+        gainNode.connect(audioContext.destination);
+
+        oscillator.start(nowTime);
+        oscillator.stop(nowTime + 0.11);
+      } catch {
+        // Audio may be blocked by browser policy or unavailable.
+      }
+    };
+
     const shoot = async () => {
       if (document.pointerLockElement !== pointerElement) {
         return;
@@ -777,6 +983,7 @@ export default function FpsGame() {
         return;
       }
       lastShotRef.value = now;
+      playShotSound();
 
       shotRay.setFromCamera(cameraVector, camera);
       const hitResults = shotRay.intersectObjects(rayTargets, true);
@@ -784,6 +991,12 @@ export default function FpsGame() {
         const id = getPlayerIdFromHit(candidate.object);
         return id && id !== session.playerId;
       });
+      const worldDirection = camera.getWorldDirection(new THREE.Vector3());
+      const tracerEnd = target
+        ? target.point.clone()
+        : camera.position.clone().add(worldDirection.multiplyScalar(140));
+      createTracer(tracerEnd);
+
       if (!target) {
         return;
       }
@@ -862,8 +1075,13 @@ export default function FpsGame() {
       const isAlive = localRef.current.hp > 0 && !localRef.current.respawnUntil;
       if (isAlive) {
         movement.set(0, 0, 0);
-        forward.set(Math.sin(localRef.current.yaw), 0, -Math.cos(localRef.current.yaw));
-        strafe.set(Math.cos(localRef.current.yaw), 0, Math.sin(localRef.current.yaw));
+        camera.getWorldDirection(forward);
+        forward.y = 0;
+        if (forward.lengthSq() <= 0.000001) {
+          forward.set(0, 0, -1);
+        }
+        forward.normalize();
+        strafe.set(-forward.z, 0, forward.x).normalize();
 
         if (controls.has("KeyW")) movement.add(forward);
         if (controls.has("KeyS")) movement.sub(forward);
@@ -919,6 +1137,13 @@ export default function FpsGame() {
         remoteAvatars.set(id, existing);
         existing.targetPosition.set(player.x, 0, player.z);
         existing.targetYaw = player.yaw;
+        if (existing.appliedFaceTexture !== player.faceTexture) {
+          applyFaceTexture(existing, player.faceTexture);
+        }
+
+        const hpScale = Math.max(0.02, Math.min(1, player.hp / 100));
+        existing.hpFill.scale.x = hpScale;
+        existing.hpFill.position.x = 0.24 * (hpScale - 1);
 
         const material = existing.body.material;
         if (material instanceof THREE.MeshStandardMaterial) {
@@ -939,6 +1164,19 @@ export default function FpsGame() {
           avatar.targetYaw,
           0.25,
         );
+      }
+
+      for (let i = tracers.length - 1; i >= 0; i -= 1) {
+        const tracer = tracers[i];
+        if (now >= tracer.expiresAt) {
+          scene.remove(tracer.line);
+          tracer.line.geometry.dispose();
+          const material = tracer.line.material;
+          if (material instanceof THREE.LineBasicMaterial) {
+            material.dispose();
+          }
+          tracers.splice(i, 1);
+        }
       }
 
       if (now - lastSyncRef.value >= NETWORK_TICK_MS) {
@@ -983,6 +1221,17 @@ export default function FpsGame() {
 
       for (const avatar of remoteAvatars.values()) {
         scene.remove(avatar.group);
+      }
+      for (const tracer of tracers) {
+        scene.remove(tracer.line);
+        tracer.line.geometry.dispose();
+        const material = tracer.line.material;
+        if (material instanceof THREE.LineBasicMaterial) {
+          material.dispose();
+        }
+      }
+      if (audioContext) {
+        void audioContext.close();
       }
 
       mount.removeChild(renderer.domElement);
@@ -1044,6 +1293,43 @@ export default function FpsGame() {
                 className="w-full rounded-xl border border-slate-400/35 bg-slate-900/80 px-4 py-3 text-sm uppercase outline-none ring-cyan-300 transition focus:ring-2"
               />
             </label>
+
+            <div className="space-y-2">
+              <span className="block text-xs uppercase tracking-[0.28em] text-cyan-200">Face Image (JPG/PNG)</span>
+              <input
+                type="file"
+                accept="image/png,image/jpeg,image/webp"
+                onChange={(event) => void handleFaceUpload(event)}
+                className="w-full rounded-xl border border-slate-400/35 bg-slate-900/80 px-3 py-2 text-sm file:mr-3 file:rounded-lg file:border-0 file:bg-cyan-500/20 file:px-3 file:py-1.5 file:text-cyan-100"
+              />
+              {faceTextureData ? (
+                <div className="flex items-center justify-between rounded-xl border border-cyan-300/35 bg-cyan-500/10 px-3 py-2">
+                  <div className="flex items-center gap-3">
+                    <NextImage
+                      src={faceTextureData}
+                      alt="Face preview"
+                      width={40}
+                      height={40}
+                      unoptimized
+                      className="h-10 w-10 rounded-lg object-cover"
+                    />
+                    <span className="text-xs text-cyan-100">{faceFileName || "Custom face ready"}</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setFaceTextureData(null);
+                      setFaceFileName("");
+                    }}
+                    className="rounded-md border border-red-300/35 bg-red-500/15 px-2 py-1 text-xs text-red-100"
+                  >
+                    Clear
+                  </button>
+                </div>
+              ) : (
+                <p className="text-xs text-sky-100/70">Optional. Visible only during this match session.</p>
+              )}
+            </div>
 
             <div className="grid gap-3 sm:grid-cols-2">
               <button
@@ -1134,7 +1420,7 @@ export default function FpsGame() {
                   <span className="truncate pr-2" style={{ color: player.color }}>
                     {isYou ? `${player.name} (you)` : player.name}
                   </span>
-                  <span className="font-mono">{player.kills}/{player.deaths}</span>
+                  <span className="font-mono">{player.kills}/{player.deaths} | {player.hp}hp</span>
                 </div>
               );
             })}
